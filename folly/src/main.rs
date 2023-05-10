@@ -1,7 +1,8 @@
+use std::borrow::Borrow;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::*;
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Error, ErrorKind};
 use std::path::Path;
 use std::rc::Rc;
@@ -41,40 +42,109 @@ fn get_char_type(c: char) -> CharType {
   }
 }
 
-#[derive(Clone, Eq, Hash, PartialEq)]
+#[derive(Default, PartialEq, Eq, Hash)]
 struct UnitKey {
   name: String,
   root_dir: String,
 }
 
+// TODO if we need to compare key against deps, reverse_deps,
+// then we can turn into HashSet<HashWrap...> instead.
 #[derive(Default)]
-struct UnitInfo {
+struct UnitInfo<K: Hash> {
   headers: Vec<String>,
   srcs: Vec<String>,
-  deps: Vec<MapVal>,
-  reverse_deps: Vec<MapVal>,
+  deps: HashSet<HashObj<K, UnitInfo<K>>>,
+  reverse_deps: HashSet<HashObj<K, UnitInfo<K>>>,
 }
+
+#[derive(Default)]
+struct IntrusiveRefCell<K, V> {
+  key: K,
+  val: RefCell<V>,
+}
+
+impl<K: PartialEq, V> PartialEq for IntrusiveRefCell<K, V> {
+  fn eq(&self, other: &Self) -> bool {
+    self.key == other.key
+  }
+}
+
+impl<K: Eq, V> Eq for IntrusiveRefCell<K, V> {}
+
+impl<K: Hash, V> Hash for IntrusiveRefCell<K, V> {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    self.key.hash(state);
+  }
+}
+
+impl<K, V: Default> From<K> for IntrusiveRefCell<K, V> {
+  fn from(item: K) -> Self {
+    IntrusiveRefCell {
+      key: item,
+      val: Default::default(),
+    }
+  }
+}
+
+// HashWrap -> &UnitKey
 
 // Potentially not the best way to work around needing
 // mutable references to two values at once.
-type MapVal = Rc<RefCell<Box<UnitInfo>>>;
-type UnitDict = HashMap<UnitKey, MapVal>;
+// Sad! Borrow trait not transitive. We wouldn't need this if:
+// Rc<T>: Borrow<T> && T: Borrow<T'> => Rc<T>: Borrow<T'>
+// This is also the reason HashObj uses the newtype pattern
+// and not the alias. Very unfortunate.
+impl<K, V> Borrow<K> for HashWrap<K, V> {
+  fn borrow(&self) -> &K {
+    &self.0.key
+  }
+}
+
+impl<K: Hash, V> Hash for HashWrap<K, V> {
+  fn hash<H: Hasher>(&self, state: &mut H) {
+    self.0.hash(state);
+  }
+}
+
+impl<K: PartialEq, V> PartialEq for HashWrap<K, V> {
+  fn eq(&self, other: &Self) -> bool {
+    self.0 == other.0
+  }
+}
+
+impl<K: Eq, V> Eq for HashWrap<K, V> {}
+
+impl<K, V> From<HashObj<K, V>> for HashWrap<K, V> {
+  fn from(item: HashObj<K, V>) -> Self {
+    HashWrap(item)
+  }
+}
+
+/////////////////// this section above should be separated out
+
+type HashObj<K, V> = Rc<IntrusiveRefCell<K, V>>;
+struct HashWrap<K, V>(HashObj<K, V>);
+type HashMap<K, V> = HashSet<HashWrap<K, V>>;
+
+type UnitObj = HashObj<UnitKey, UnitInfo<UnitKey>>;
+type UnitMap = HashMap<UnitKey, UnitInfo<UnitKey>>;
 // TODO
 type UnitTrie = ();
 
-trait MutateExtract<K, V: Default> {
-  fn extract_with_create(&mut self, key: &K) -> Rc<RefCell<V>>;
+trait MutateExtract<K, V> {
+  fn extract_with_create(&mut self, key: K) -> V;
 }
 
-impl<K: Clone + Eq + Hash + PartialEq, V: Default> MutateExtract<K, V>
-  for HashMap<K, Rc<RefCell<V>>>
+impl<K: Eq + Hash + PartialEq, V: Default> MutateExtract<K, HashObj<K, V>>
+  for HashMap<K, V>
 {
-  fn extract_with_create(&mut self, key: &K) -> Rc<RefCell<V>> {
-    if self.contains_key(key) {
-      self.get(key).unwrap().clone()
+  fn extract_with_create(&mut self, key: K) -> HashObj<K, V> {
+    if self.contains(&key) {
+      self.get(&key).unwrap().0.clone()
     } else {
-      let val = Rc::new(RefCell::new(Default::default()));
-      self.insert(key.clone(), val.clone());
+      let val = Rc::new(IntrusiveRefCell::from(key));
+      self.insert(HashWrap(val.clone()));
       val
     }
   }
@@ -90,12 +160,11 @@ trait CompileGraph<T: CompileTrie> {
   fn generate_compilation_trie(&mut self) -> Result<T, Error>;
 }
 
-trait _UnitDict {
+trait _UnitMap {
   fn add_dependency_edges(
     &mut self,
     file_path: &Path,
-    curr_key: UnitKey,
-    curr_node: MapVal,
+    curr_node: UnitObj,
   ) -> Result<(), Error>;
   fn add_node(&mut self, file_path: &Path) -> Result<(), Error>;
 }
@@ -106,12 +175,11 @@ impl CompileTrie for UnitTrie {
   }
 }
 
-impl _UnitDict for UnitDict {
+impl _UnitMap for UnitMap {
   fn add_dependency_edges(
     &mut self,
     file_path: &Path,
-    curr_key: UnitKey,
-    curr_node: MapVal,
+    curr_node: UnitObj,
   ) -> Result<(), Error> {
     let file = BufReader::new(File::open(file_path)?);
     for line in file.lines() {
@@ -119,16 +187,20 @@ impl _UnitDict for UnitDict {
       match strip_include(&line) {
         None => continue,
         Some((dep_key, hlib)) => {
-          if dep_key == curr_key {
+          if dep_key == curr_node.key {
             continue;
           }
           println!("{}, {}", dep_key.name, dep_key.root_dir);
           match hlib {
             HeaderLib::FOLLY => {
-              let dep_node: MapVal = self.extract_with_create(&dep_key);
+              let dep_node: UnitObj = self.extract_with_create(dep_key);
 
-              dep_node.borrow_mut().reverse_deps.push(curr_node.clone());
-              curr_node.borrow_mut().deps.push(dep_node);
+              dep_node
+                .val
+                .borrow_mut()
+                .reverse_deps
+                .insert(curr_node.clone());
+              curr_node.val.borrow_mut().deps.insert(dep_node.clone());
             }
             HeaderLib::UNKNOWN => {
               // TODO other header types
@@ -176,23 +248,25 @@ impl _UnitDict for UnitDict {
       name: curr_node_name,
       root_dir: parent_string,
     };
-    let curr_node: MapVal = self.extract_with_create(&curr_key);
+    let curr_node: UnitObj = self.extract_with_create(curr_key);
     match file_type {
-      FileType::TEMPLATE | FileType::HEADER => {
-        curr_node.borrow_mut().headers.push(file_name.to_string())
-      }
+      FileType::TEMPLATE | FileType::HEADER => curr_node
+        .val
+        .borrow_mut()
+        .headers
+        .push(file_name.to_string()),
       FileType::SOURCE | FileType::TEST => {
-        curr_node.borrow_mut().srcs.push(file_name.to_string())
+        curr_node.val.borrow_mut().srcs.push(file_name.to_string())
       }
       FileType::UNKNOWN => unreachable!(),
     }
 
     println!("Path {}", file_path.display());
-    self.add_dependency_edges(file_path, curr_key, curr_node)
+    self.add_dependency_edges(file_path, curr_node)
   }
 }
 
-impl CompileGraph<UnitTrie> for UnitDict {
+impl CompileGraph<UnitTrie> for UnitMap {
   fn add_initial_subtree(&mut self, file_path: &Path) -> Result<(), Error> {
     if file_path.is_dir() {
       for child in std::fs::read_dir(file_path)? {
@@ -333,7 +407,7 @@ fn strip_include(line: &str) -> Option<(UnitKey, HeaderLib)> {
 fn main() {
   let root = Path::new("/Users/victoria/folly");
   let input_root = root.join("folly");
-  let mut dict: UnitDict = HashMap::new();
+  let mut dict: UnitMap = HashSet::new();
   match dict.add_initial_subtree(&input_root) {
     Ok(_) => match dict.collapse_cycles() {
       Ok(_) => match dict.generate_compilation_trie() {
