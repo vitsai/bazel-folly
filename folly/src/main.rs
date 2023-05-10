@@ -1,11 +1,12 @@
-use std::borrow::Borrow;
-use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::*;
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::io::{BufRead, BufReader, Error, ErrorKind};
 use std::path::Path;
-use std::rc::Rc;
+
+use crate::intrusive_hashmap::{HashMap, HashObj, MutateExtract};
+
+mod intrusive_hashmap;
 
 #[derive(PartialEq)]
 enum FileType {
@@ -58,97 +59,10 @@ struct UnitInfo<K: Hash> {
   reverse_deps: HashSet<HashObj<K, UnitInfo<K>>>,
 }
 
-#[derive(Default)]
-struct IntrusiveRefCell<K, V> {
-  key: K,
-  val: RefCell<V>,
-}
-
-impl<K: PartialEq, V> PartialEq for IntrusiveRefCell<K, V> {
-  fn eq(&self, other: &Self) -> bool {
-    self.key == other.key
-  }
-}
-
-impl<K: Eq, V> Eq for IntrusiveRefCell<K, V> {}
-
-impl<K: Hash, V> Hash for IntrusiveRefCell<K, V> {
-  fn hash<H: Hasher>(&self, state: &mut H) {
-    self.key.hash(state);
-  }
-}
-
-impl<K, V: Default> From<K> for IntrusiveRefCell<K, V> {
-  fn from(item: K) -> Self {
-    IntrusiveRefCell {
-      key: item,
-      val: Default::default(),
-    }
-  }
-}
-
-// HashWrap -> &UnitKey
-
-// Potentially not the best way to work around needing
-// mutable references to two values at once.
-// Sad! Borrow trait not transitive. We wouldn't need this if:
-// Rc<T>: Borrow<T> && T: Borrow<T'> => Rc<T>: Borrow<T'>
-// This is also the reason HashObj uses the newtype pattern
-// and not the alias. Very unfortunate.
-impl<K, V> Borrow<K> for HashWrap<K, V> {
-  fn borrow(&self) -> &K {
-    &self.0.key
-  }
-}
-
-impl<K: Hash, V> Hash for HashWrap<K, V> {
-  fn hash<H: Hasher>(&self, state: &mut H) {
-    self.0.hash(state);
-  }
-}
-
-impl<K: PartialEq, V> PartialEq for HashWrap<K, V> {
-  fn eq(&self, other: &Self) -> bool {
-    self.0 == other.0
-  }
-}
-
-impl<K: Eq, V> Eq for HashWrap<K, V> {}
-
-impl<K, V> From<HashObj<K, V>> for HashWrap<K, V> {
-  fn from(item: HashObj<K, V>) -> Self {
-    HashWrap(item)
-  }
-}
-
-/////////////////// this section above should be separated out
-
-type HashObj<K, V> = Rc<IntrusiveRefCell<K, V>>;
-struct HashWrap<K, V>(HashObj<K, V>);
-type HashMap<K, V> = HashSet<HashWrap<K, V>>;
-
 type UnitObj = HashObj<UnitKey, UnitInfo<UnitKey>>;
 type UnitMap = HashMap<UnitKey, UnitInfo<UnitKey>>;
 // TODO
 type UnitTrie = ();
-
-trait MutateExtract<K, V> {
-  fn extract_with_create(&mut self, key: K) -> V;
-}
-
-impl<K: Eq + Hash + PartialEq, V: Default> MutateExtract<K, HashObj<K, V>>
-  for HashMap<K, V>
-{
-  fn extract_with_create(&mut self, key: K) -> HashObj<K, V> {
-    if self.contains(&key) {
-      self.get(&key).unwrap().0.clone()
-    } else {
-      let val = Rc::new(IntrusiveRefCell::from(key));
-      self.insert(HashWrap(val.clone()));
-      val
-    }
-  }
-}
 
 trait CompileTrie {
   fn write_build_files(&self) -> Result<(), Error>;
